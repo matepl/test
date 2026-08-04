@@ -65,18 +65,77 @@ python3 recover.py selftest
 python3 recover.py run --archive /pfad/zu/deiner_datei.7z
 
 # Nützliche Einzelschritte:
+python3 recover.py add wort1 wort2 "zwei woerter"  # Wörter ergänzen (nur diese werden getestet)
+python3 recover.py words                 # Fortschritt: was wurde schon geprüft?
 python3 recover.py extract -f datei.7z   # nur den Hash extrahieren
 python3 recover.py intake                # nur die Fragen (neu) beantworten
 python3 recover.py status                # steht das Passwort schon?
-python3 recover.py reset                 # Config/State/Hash zurücksetzen
+python3 recover.py reset                 # Config/State/Ledger/Hash zurücksetzen
 ```
 
 **Abbrechen ist sicher:** `Strg-C` speichert den Fortschritt. Ein erneutes
-`python3 recover.py run` **setzt automatisch fort** (hashcat-Sessions + Potfile).
-Erschöpfte Stufen werden nicht erneut gestartet.
+`python3 recover.py run` **setzt automatisch fort** (Ledger + hashcat-Sessions +
+Potfile). Erschöpfte Stufen werden nicht erneut gestartet.
 
 Ergebnis: Das Passwort wird angezeigt **und** in `work/PASSWORT_GEFUNDEN.txt`
 gespeichert.
+
+---
+
+## Erweiterbares Wörterbuch – ohne doppelte Arbeit
+
+Das ist der Kern: Du kannst dein Wörterbuch **jederzeit ergänzen**, und beim
+nächsten Lauf testet das Skript **nur die neuen Wörter und die neuen
+Kombinationen** – bereits geprüfte Arbeit wird nie wiederholt.
+
+**Wörter ergänzen** – zwei Wege, beide gleichwertig:
+
+```bash
+# a) bequem per Befehl (dedupliziert automatisch)
+python3 recover.py add mausi 1234 "roter drache"
+
+# b) oder Dateien direkt bearbeiten / neue anlegen:
+#    words/dictionary.txt      <- ein Wort pro Zeile
+#    words/beliebiger_name.txt <- jede weitere .txt wird automatisch eingelesen
+#    words/numbers.txt         <- Zahlen/Jahre
+```
+
+**Sehen, was schon geprüft wurde:**
+
+```bash
+python3 recover.py words
+```
+
+Beispielausgabe (die Zahlen bedeuten *verarbeitet / aktuell vorhanden / NEU offen*):
+
+```
+  Fortschritt je Stufe (verarbeitet / aktuell / NEU offen):
+    [fertig] P1: Persoenliche Woerter (roh)              120 /   120 / 0
+    [neu!]   P1: Persoenliche Woerter + Basisregeln       96 /   120 / 24
+    [fertig] P3: Wort + Wort (Kombinator)             L 60/60  R 60/60
+```
+
+Zusätzlich schreibt das Skript ein chronologisches Protokoll nach
+`work/tested.log` (Zeitstempel, Stufe, wie viele neue Kandidaten getestet wurden).
+
+### Wie das technisch funktioniert (kurz)
+
+Für jede wörterbasierte Angriffsstufe merkt sich ein **Ledger**
+(`work/ledger.json`), welche Kandidaten dort schon durchliefen. Beim Lauf gilt:
+
+- **Straight-/Regel-/Hybrid-Stufen:** getestet wird nur
+  `aktuelle Kandidaten − bereits geprüfte` → nur die neuen Wörter.
+- **Kombinator-Stufen (Wort×Wort, Wort×Zahl):** bei neuen Wörtern werden gezielt
+  nur die neuen Paare gefahren: `(neu_links × alle_rechts) ∪ (alt_links ×
+  neu_rechts)`. Die bereits geprüften `alt×alt`-Paare werden übersprungen – ohne
+  Lücke und ohne Wiederholung.
+- Änderst du die *Regel* einer Stufe (anderer Regelsatz), bekommt sie einen neuen
+  Ledger-Eintrag und läuft für diese neue Regel komplett – die alte Arbeit bleibt
+  aber getrennt gespeichert und wird nicht doppelt gemacht.
+
+> Hinweis: Große externe Wortlisten (rockyou) sowie Masken- und Brute-Force-Stufen
+> sind nicht wort-basiert; ihr Fortschritt wird über hashcat-Sessions/`--restore`
+> und die Erschöpft-Markierung fortgesetzt.
 
 ---
 
@@ -117,9 +176,10 @@ Wort mit Regel wird in Minuten gefunden; blinde Brute-Force über 10 Zeichen wü
 Jahre dauern. Deshalb kommt das Billige und Wahrscheinliche zuerst.
 
 ### Selbst erweitern – ohne Code zu ändern
+- **Bessere Wörter:** `python3 recover.py add <wort> ...` oder `words/*.txt`
+  bearbeiten → beim nächsten Lauf werden **nur die neuen** getestet.
 - **Eigene Regeln:** Datei `work/builtin.rule` ergänzen (hashcat-Regelsyntax).
 - **Eigene Masken:** Zeilen an `work/masks.hcmask` anhängen (z. B. `?u?l?l?l?l?d?d?d?d`).
-- **Bessere Wörter:** `python3 recover.py intake` erneut ausführen und ergänzen.
 
 Diese Dateien werden beim nächsten `run` automatisch mitbenutzt.
 

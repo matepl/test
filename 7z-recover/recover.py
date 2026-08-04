@@ -14,18 +14,32 @@ Ablauf:
        schnelle, gezielte Angriffe zuerst -> immer breitere/teurere zuletzt.
   5. Ergebnis: das gefundene Passwort wird angezeigt und gespeichert.
 
-Du musst am Algorithmus NICHTS anpassen. Einmal die Fragen beantworten,
-dann `python3 recover.py run` starten und laufen lassen. Abbrechen (Strg-C)
-und spaeter erneut starten setzt automatisch fort (Sessions + Potfile).
+ERWEITERBARES WOERTERBUCH & KEINE DOPPELTE ARBEIT
+-------------------------------------------------
+Woerter liegen im Ordner  words/  (eine oder mehrere .txt-Dateien, editierbar).
+Du kannst jederzeit Woerter ergaenzen:
+    python3 recover.py add wort1 wort2 "zwei woerter"
+    (oder einfach words/dictionary.txt bzw. eigene words/*.txt-Dateien bearbeiten)
+
+Beim naechsten Lauf testet das Skript NUR die neu hinzugekommenen Woerter und
+die neuen Kombinationen - bereits geprueftes wird nicht wiederholt. Was schon
+getestet wurde, siehst du mit:
+    python3 recover.py words       # Fortschritt pro Angriffsstufe
+    work/tested.log                # chronologisches Protokoll
+
+Du musst am Algorithmus NICHTS anpassen. Abbrechen (Strg-C) und spaeter erneut
+starten setzt automatisch fort (Ledger + Sessions + Potfile).
 
 Rechtlicher Hinweis: Nur fuer Dateien verwenden, die dir gehoeren / fuer die du
 autorisiert bist. Passwort-Recovery an fremden Daten ist illegal.
 """
 
 import argparse
+import datetime
+import hashlib
 import json
-import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -38,11 +52,16 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 WORK = HERE / "work"                 # Alle Laufzeit-Dateien landen hier
+WORDS_DIR = HERE / "words"           # Erweiterbares Woerterbuch (deine *.txt)
 CONFIG_FILE = WORK / "config.json"   # Deine Antworten (persoenlicher Kontext)
-STATE_FILE = WORK / "state.json"     # Fortschritt der Angriffe
+STATE_FILE = WORK / "state.json"     # Fortschritt der NICHT-Wort-Angriffe
+LEDGER_FILE = WORK / "ledger.json"   # Welche Woerter/Paare je Stufe geprueft wurden
+TESTED_LOG = WORK / "tested.log"     # Menschenlesbares Pruef-Protokoll
 HASH_FILE = WORK / "hash.txt"        # Extrahierter 7z-Hash (hashcat-Format)
 POTFILE = WORK / "cracked.pot"       # Gefundene Passwoerter (hashcat potfile)
 RESULT_FILE = WORK / "PASSWORT_GEFUNDEN.txt"
+DICT_FILE = WORDS_DIR / "dictionary.txt"   # Standard-Woerterbuch (editierbar)
+NUMBERS_FILE = WORDS_DIR / "numbers.txt"   # Zahlen/Jahre (editierbar)
 
 HASH_MODE = "11600"                  # hashcat mode fuer 7-Zip
 
@@ -125,19 +144,96 @@ def find_first(paths):
             return str(p)
     return None
 
+def akey(*parts):
+    """Stabiler, kurzer Schluessel fuer eine Angriffsstufe."""
+    return hashlib.md5("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()[:10]
+
+# --------------------------------------------------------------------------
+# Woerterbuch: sammeln & Varianten (Basis fuer die Delta-Logik)
+# --------------------------------------------------------------------------
+
+def collect_base_words(cfg):
+    """Alle Basiswoerter = Config-Woerter + alle words/*.txt (ausser numbers.txt)."""
+    words = set(w.strip() for w in cfg.get("words", []) if w.strip())
+    if WORDS_DIR.exists():
+        for f in sorted(WORDS_DIR.glob("*.txt")):
+            if f.name == NUMBERS_FILE.name:
+                continue
+            for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    words.add(line)
+    return words
+
+def collect_numbers(cfg):
+    nums = set(str(n).strip() for n in cfg.get("numbers", []) if str(n).strip())
+    if NUMBERS_FILE.exists():
+        for line in NUMBERS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                nums.add(line)
+    return nums
+
+def variant_lines(words):
+    """Voller Varianten-Satz je Wort (fuer Straight-/Regel-/Hybrid-Angriffe)."""
+    out = set()
+    for w in words:
+        if not w:
+            continue
+        out.add(w)
+        out.add(w.lower())
+        out.add(w.capitalize())
+        out.add(w.upper())
+    return out
+
+def combo_lines(words):
+    """Kompakter Varianten-Satz fuer Kombinator-Angriffe (begrenzt die Explosion)."""
+    out = set()
+    for w in words:
+        if not w:
+            continue
+        out.add(w.lower())
+        out.add(w.capitalize())
+    return out
+
+def write_lines(path, lines):
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+# --------------------------------------------------------------------------
+# Ledger (welche Kandidaten/Paare je Stufe bereits geprueft wurden)
+# --------------------------------------------------------------------------
+
+def load_ledger():
+    led = load_json(LEDGER_FILE, {})
+    led.setdefault("attacks", {})   # key -> {"name":.., "words":[...]}
+    led.setdefault("combi", {})     # key -> {"name":.., "left":[...], "right":[...]}
+    return led
+
+def save_ledger(led):
+    save_json(LEDGER_FILE, led)
+
+def log_tested(name, new_count, total):
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    line = f"{ts}  {name}  +{new_count} neue Kandidaten getestet (verarbeitet gesamt: {total})\n"
+    try:
+        with open(TESTED_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
 # --------------------------------------------------------------------------
 # Tool-Erkennung
 # --------------------------------------------------------------------------
 
 def detect_tools():
-    tools = {
+    return {
         "hashcat": which("hashcat"),
         "perl": which("perl"),
         "7z2hashcat": which("7z2hashcat.pl", "7z2hashcat"),
         "7z2john": which("7z2john.pl", "7z2john"),
         "john": which("john"),
     }
-    return tools
 
 def print_install_hint():
     warn("Ein oder mehrere Tools fehlen. Installationshinweise:")
@@ -165,7 +261,6 @@ def print_install_hint():
 # --------------------------------------------------------------------------
 
 def extract_hash(archive, tools):
-    """Extrahiert den 7z-Hash im hashcat-Format nach HASH_FILE."""
     if HASH_FILE.exists() and HASH_FILE.stat().st_size > 0:
         ok(f"Hash bereits extrahiert: {HASH_FILE}")
         return True
@@ -178,8 +273,6 @@ def extract_hash(archive, tools):
     WORK.mkdir(parents=True, exist_ok=True)
     raw = ""
 
-    # 7z2hashcat (philsmd) ist ideal: liefert direkt hashcat-Format und geht
-    # mit grossen Dateien schlau um (waehlt den kleinsten pruefbaren Stream).
     if tools.get("7z2hashcat") and tools.get("perl"):
         info("Extrahiere Hash mit 7z2hashcat ...")
         try:
@@ -189,7 +282,6 @@ def extract_hash(archive, tools):
         except Exception as e:
             warn(f"7z2hashcat fehlgeschlagen: {e}")
 
-    # Fallback: 7z2john (John the Ripper). Gibt "datei:$7z$..." aus -> Prefix weg.
     if not raw and tools.get("7z2john") and tools.get("perl"):
         info("Extrahiere Hash mit 7z2john ...")
         try:
@@ -203,7 +295,6 @@ def extract_hash(archive, tools):
         err("Konnte keinen Hash extrahieren. Ist 7z2hashcat oder 7z2john installiert?")
         return False
 
-    # Nur die $7z$-Zeile(n) behalten und evtl. Datei-Prefix entfernen.
     lines = []
     for line in raw.splitlines():
         idx = line.find("$7z$")
@@ -221,7 +312,7 @@ def extract_hash(archive, tools):
     return True
 
 # --------------------------------------------------------------------------
-# Schritt 2: Interaktive Abfrage des persoenlichen Kontexts
+# Schritt 2: Interaktive Abfrage
 # --------------------------------------------------------------------------
 
 def run_intake():
@@ -229,132 +320,102 @@ def run_intake():
     print("""  Je besser diese Angaben, desto hoeher die Erfolgschance. Alles optional -
   einfach Enter druecken zum Ueberspringen. Denk an das Passwort so, wie DU
   frueher Passwoerter gebildet hast (Namen, Jahre, Lieblingswoerter, Muster).
+  (Woerter kannst du spaeter jederzeit mit 'add' ergaenzen.)
 """)
-    cfg = {}
+    cfg = load_json(CONFIG_FILE, {})
 
-    # --- Basis-Woerter -----------------------------------------------------
     words = []
     words += ask_list("Vornamen/Nachnamen (du, Familie, Partner, Kinder, Haustiere)")
     words += ask_list("Wichtige Woerter (Hobbys, Orte, Bands, Vereine, Firmen, Spitznamen)")
     words += ask_list("Weitere moegliche Basiswoerter")
-    cfg["words"] = sorted(set(w for w in words if w))
+    cfg["words"] = sorted(set(list(cfg.get("words", [])) + [w for w in words if w]))
 
-    # --- Zahlen / Daten ----------------------------------------------------
     numbers = ask_list("Wichtige Jahre/Zahlen (Geburtsjahre, PLZ, Lieblingszahlen)")
     dates = ask_list("Wichtige Daten (z.B. 1985, 0304, 03041985, ddmmyyyy)")
-    cfg["numbers"] = sorted(set(numbers + dates))
+    cfg["numbers"] = sorted(set(list(cfg.get("numbers", [])) + numbers + dates))
 
-    # --- Sonderzeichen -----------------------------------------------------
-    default_syms = "!?.@#$_-*+1"
-    syms = ask("Welche Sonderzeichen/Endungen nutzt du typischerweise", default_syms)
-    cfg["symbols"] = syms
+    default_syms = cfg.get("symbols", "!?.@#$_-*+1")
+    cfg["symbols"] = ask("Welche Sonderzeichen/Endungen nutzt du typischerweise", default_syms)
 
-    # --- Laenge ------------------------------------------------------------
-    cfg["min_len"] = int(ask("Vermutete MINIMALE Passwortlaenge", "6") or "6")
-    cfg["max_len"] = int(ask("Vermutete MAXIMALE Passwortlaenge", "12") or "12")
+    cfg["min_len"] = int(ask("Vermutete MINIMALE Passwortlaenge", str(cfg.get("min_len", 6))) or "6")
+    cfg["max_len"] = int(ask("Vermutete MAXIMALE Passwortlaenge", str(cfg.get("max_len", 12))) or "12")
 
-    # --- Zeichenklassen-Gewohnheiten --------------------------------------
-    cfg["cap_first"] = ask_yesno("Faengt dein Passwort oft mit einem Grossbuchstaben an?", True)
-    cfg["has_upper"] = ask_yesno("Nutzt du (auch mitten drin) Grossbuchstaben?", True)
-    cfg["has_digits"] = ask_yesno("Enthaelt es meistens Ziffern?", True)
-    cfg["digits_at_end"] = ask_yesno("Stehen Ziffern meist am ENDE?", True)
-    cfg["has_symbols"] = ask_yesno("Enthaelt es Sonderzeichen?", True)
+    cfg["cap_first"] = ask_yesno("Faengt dein Passwort oft mit einem Grossbuchstaben an?", cfg.get("cap_first", True))
+    cfg["has_upper"] = ask_yesno("Nutzt du (auch mitten drin) Grossbuchstaben?", cfg.get("has_upper", True))
+    cfg["has_digits"] = ask_yesno("Enthaelt es meistens Ziffern?", cfg.get("has_digits", True))
+    cfg["digits_at_end"] = ask_yesno("Stehen Ziffern meist am ENDE?", cfg.get("digits_at_end", True))
+    cfg["has_symbols"] = ask_yesno("Enthaelt es Sonderzeichen?", cfg.get("has_symbols", True))
 
-    # --- Struktur ----------------------------------------------------------
     print("""
   Typische Struktur deines Passworts?
-    1) Wort + Ziffern am Ende        (z.B. Berlin2010, hund123)
+    1) Wort + Ziffern am Ende         (z.B. Berlin2010, hund123)
     2) Wort + Sonderzeichen + Ziffern (z.B. Berlin!2010)
     3) Zwei Woerter kombiniert        (z.B. redhouse, BierGarten)
     4) Nur Ziffern (PIN-artig)        (z.B. 04031985)
     5) Unbekannt / gemischt
 """)
-    cfg["structure"] = ask("Auswahl 1-5", "5")
+    cfg["structure"] = ask("Auswahl 1-5", cfg.get("structure", "5"))
+    cfg["leet"] = ask_yesno("Ersetzt du Buchstaben durch Zeichen (a->@, e->3, o->0, s->$)?", cfg.get("leet", False))
 
-    # --- Leetspeak ---------------------------------------------------------
-    cfg["leet"] = ask_yesno("Ersetzt du Buchstaben durch Zeichen (a->@, e->3, o->0, s->$)?", False)
-
-    # --- Externe Ressourcen ------------------------------------------------
-    print()
     guessed_wl = find_first([str(Path(d) / "rockyou.txt") for d in COMMON_WORDLIST_DIRS])
     cfg["big_wordlist"] = ask("Pfad zu grosser Wortliste (z.B. rockyou.txt), leer=auto",
-                              guessed_wl or "")
-    cfg["extra_wordlist_dir"] = ask("Ordner mit weiteren Wortlisten (optional)", "")
-
-    # --- Laufzeit / Hardware ----------------------------------------------
-    cfg["total_hours"] = float(ask("Gesamtlaufzeit in Stunden bevor gestoppt wird", "8") or "8")
-    cfg["use_optimized"] = ask_yesno("Optimierten Kernel nutzen (-O, schneller, Laenge<=~31)?", True)
-    cfg["workload"] = ask("hashcat Workload-Profil 1..4 (3=Desktop, 4=nur dediziert)", "3")
+                              cfg.get("big_wordlist", guessed_wl or ""))
+    cfg["total_hours"] = float(ask("Gesamtlaufzeit in Stunden bevor gestoppt wird",
+                                    str(cfg.get("total_hours", 8))) or "8")
+    cfg["use_optimized"] = ask_yesno("Optimierten Kernel nutzen (-O, schneller, Laenge<=~31)?",
+                                     cfg.get("use_optimized", True))
+    cfg["workload"] = ask("hashcat Workload-Profil 1..4 (3=Desktop, 4=nur dediziert)",
+                          str(cfg.get("workload", "3")))
 
     save_json(CONFIG_FILE, cfg)
     ok(f"Konfiguration gespeichert: {CONFIG_FILE}")
     return cfg
 
 # --------------------------------------------------------------------------
-# Schritt 3: Wortlisten / Masken aus dem Kontext generieren
+# Schritt 3: Eingaben vorbereiten (Woerterbuch, Zahlen, Regeln, Masken)
 # --------------------------------------------------------------------------
 
-def generate_wordlists(cfg):
-    """Erzeugt kompakte, persoenliche Basis-Listen. Mutationen macht hashcat via Regeln."""
+def prepare_inputs(cfg):
     WORK.mkdir(parents=True, exist_ok=True)
+    WORDS_DIR.mkdir(parents=True, exist_ok=True)
 
-    base_words = set()
-    for w in cfg.get("words", []):
-        w = w.strip()
-        if not w:
-            continue
-        base_words.add(w)
-        base_words.add(w.lower())
-        base_words.add(w.capitalize())
-        base_words.add(w.upper())
+    # Standard-Woerterbuch aus Config-Woertern anlegen (nur beim ersten Mal),
+    # damit du es sehen und editieren kannst.
+    if not DICT_FILE.exists():
+        seed = sorted(set(cfg.get("words", [])))
+        header = ("# Dein Woerterbuch - ein Wort pro Zeile. Jederzeit ergaenzbar.\n"
+                  "# Neue Woerter werden beim naechsten Lauf automatisch (nur sie) getestet.\n"
+                  "# Weitere Dateien words/*.txt werden ebenfalls eingelesen.\n")
+        DICT_FILE.write_text(header + "\n".join(seed) + ("\n" if seed else ""), encoding="utf-8")
 
-    base_file = WORK / "personal_base.txt"
-    base_file.write_text("\n".join(sorted(base_words)) + "\n", encoding="utf-8")
+    if not NUMBERS_FILE.exists():
+        nums = set(cfg.get("numbers", []))
+        for y in range(1970, 2027):
+            nums.add(str(y))
+        header = "# Zahlen/Jahre - ein Eintrag pro Zeile. Jederzeit ergaenzbar.\n"
+        NUMBERS_FILE.write_text(header + "\n".join(sorted(nums)) + "\n", encoding="utf-8")
 
-    num_file = WORK / "personal_numbers.txt"
-    nums = set(cfg.get("numbers", []))
-    # Ein paar generische, aber wahrscheinliche Zahlen ergaenzen.
-    for y in range(1970, 2027):
-        nums.add(str(y))
-    num_file.write_text("\n".join(sorted(nums)) + "\n", encoding="utf-8")
-
-    ok(f"Persoenliche Basiswoerter: {len(base_words)} -> {base_file.name}")
-    ok(f"Zahlen/Jahre: {len(nums)} -> {num_file.name}")
-
-    # Eigene Regel-Datei erzeugen (falls keine grosse Regel vorhanden ist).
     write_builtin_rules(cfg)
 
-    # Masken aus Struktur ableiten.
     masks = build_masks(cfg)
-    mask_file = WORK / "masks.hcmask"
-    mask_file.write_text("\n".join(masks) + "\n", encoding="utf-8")
-    ok(f"Masken generiert: {len(masks)} -> {mask_file.name}")
-
-    return base_file, num_file, mask_file
+    write_lines(WORK / "masks.hcmask", masks)
+    ok(f"Eingaben vorbereitet. Woerterbuch: {DICT_FILE}")
 
 def write_builtin_rules(cfg):
-    """Kompaktes Regelset (haeufige Mutationen) als Fallback zu best64/OneRule."""
     rules = [
-        ":",            # unveraendert
-        "c", "C", "u", "l", "t",      # Gross/Klein-Varianten
-        "$1", "$2", "$3", "$!", "$.", "$@", "$#",   # ein Zeichen anhaengen
-        "$1$2$3", "$1$2$3$4",
-        "$0$1", "$1$2", "$2$0$1$1",
-        "$!$!", "$1$!",
-        "^!",            # Zeichen voranstellen
-        "so0", "se3", "sa@", "si1", "ss$",          # einzelne Leet-Substitutionen
-        "c $1", "c $1$2$3", "c $!",
-        "r",             # umgedreht
-        "$2$0$1$0", "$2$0$1$5", "$2$0$2$0",         # Jahre
+        ":", "c", "C", "u", "l", "t",
+        "$1", "$2", "$3", "$!", "$.", "$@", "$#",
+        "$1$2$3", "$1$2$3$4", "$0$1", "$1$2", "$2$0$1$1",
+        "$!$!", "$1$!", "^!",
+        "so0", "se3", "sa@", "si1", "ss$",
+        "c $1", "c $1$2$3", "c $!", "r",
+        "$2$0$1$0", "$2$0$1$5", "$2$0$2$0",
     ]
-    # Jahre 19xx/20xx anhaengen
-    for y in list(range(1970, 2027)):
+    for y in range(1970, 2027):
         rules.append("$" + "$".join(list(str(y))))
-    (WORK / "builtin.rule").write_text("\n".join(rules) + "\n", encoding="utf-8")
+    write_lines(WORK / "builtin.rule", rules)
 
 def build_masks(cfg):
-    """Erzeugt gezielte hashcat-Masken aus den Struktur-Angaben.
-    Custom-Charset 1 (?1) = die Sonderzeichen des Users."""
     masks = []
     mn, mx = cfg.get("min_len", 6), cfg.get("max_len", 12)
     structure = cfg.get("structure", "5")
@@ -362,36 +423,26 @@ def build_masks(cfg):
     def letters(n, cap_first):
         if n <= 0:
             return ""
-        if cap_first:
-            return "?u" + "?l" * (n - 1)
-        return "?l" * n
+        return ("?u" + "?l" * (n - 1)) if cap_first else ("?l" * n)
 
-    # 4) Nur Ziffern (PIN) -> vollstaendig sinnvoll, auch laenger.
     if structure == "4" or cfg.get("has_digits"):
         for L in range(max(4, mn), min(mx, 12) + 1):
             masks.append("?d" * L)
-
-    # 1) Wort + Ziffern am Ende
     if structure in ("1", "5"):
         for total in range(mn, mx + 1):
             for d in (2, 3, 4):
                 if total - d >= 2:
                     masks.append(letters(total - d, cfg.get("cap_first", True)) + "?d" * d)
-
-    # 2) Wort + Sonderzeichen + Ziffern
     if structure in ("2", "5") and cfg.get("has_symbols"):
         for total in range(mn, mx + 1):
             for d in (2, 4):
                 base = total - d - 1
                 if base >= 2:
                     masks.append(letters(base, cfg.get("cap_first", True)) + "?1" + "?d" * d)
-
-    # 3) Zwei Woerter (nur Buchstaben) - grob per Masken abgedeckt
     if structure in ("3", "5"):
         for total in range(max(mn, 6), min(mx, 12) + 1):
             masks.append(letters(total, cfg.get("cap_first", True)))
 
-    # Duplikate entfernen, Reihenfolge (kurz -> lang) beibehalten.
     seen, out = set(), []
     for m in masks:
         if m not in seen:
@@ -400,7 +451,81 @@ def build_masks(cfg):
     return out
 
 # --------------------------------------------------------------------------
-# Schritt 4: Angriffs-Engine
+# Angriffsplan
+# --------------------------------------------------------------------------
+
+def build_attack_plan(cfg):
+    """Liefert die eskalierende Stufenliste. Jede Stufe hat 'family' + stabilen 'key'.
+    Personal-/Hybrid-/Kombinator-Stufen sind DELTA-faehig (nur neue Woerter)."""
+    plan = []
+    builtin_rule = str(WORK / "builtin.rule")
+    best64 = find_first([str(Path(d) / "best64.rule") for d in COMMON_RULE_DIRS])
+    onerule = find_first(
+        [str(Path(d) / n) for d in COMMON_RULE_DIRS
+         for n in ("OneRuleToRuleThemAll.rule", "dive.rule", "rockyou-30000.rule")])
+    big_wl = cfg.get("big_wordlist", "").strip() or \
+        (find_first([str(Path(d) / "rockyou.txt") for d in COMMON_WORDLIST_DIRS]) or "")
+
+    def add(**a):
+        a["key"] = akey(a["family"], a.get("kind", ""), a.get("rule", ""),
+                        a.get("mask", ""), a.get("left_kind", ""),
+                        a.get("right_kind", ""), a["name"])
+        plan.append(a)
+
+    # --- Phase 1: schnelle, gezielte Treffer -------------------------------
+    add(family="wl_personal", kind="wl", rule=None, budget=180,
+        name="P1: Persoenliche Woerter (roh)")
+    add(family="wl_personal", kind="wl", rule=builtin_rule, budget=600,
+        name="P1: Persoenliche Woerter + Basisregeln")
+
+    # --- Phase 2: persoenliche Woerter mit starken Regeln ------------------
+    if best64:
+        add(family="wl_personal", kind="wl", rule=best64, budget=600,
+            name="P2: Persoenlich + best64")
+    if onerule:
+        add(family="wl_personal", kind="wl", rule=onerule, budget=1200,
+            name="P2: Persoenlich + grosse Regel")
+
+    # --- Phase 3: Hybrid & Kombinationen -----------------------------------
+    add(family="hybrid_personal", kind="hybrid6", mask="?d?d?d?d", budget=600,
+        name="P3: Wort + 2-4 Ziffern (Hybrid)")
+    add(family="hybrid_personal", kind="hybrid7", mask="?d?d?d?d", budget=600,
+        name="P3: 2-4 Ziffern + Wort (Hybrid)")
+    if cfg.get("symbols"):
+        add(family="hybrid_personal", kind="hybrid6", mask="?1", budget=300,
+            name="P3: Wort + Sonderzeichen (Hybrid)")
+    add(family="combi", left_kind="words", right_kind="words", budget=600,
+        name="P3: Wort + Wort (Kombinator)")
+    add(family="combi", left_kind="words", right_kind="numbers", budget=600,
+        name="P3: Wort + Zahl/Jahr (Kombinator)")
+
+    # --- Phase 4: grosse Wortliste (NICHT delta - fixe externe Liste) ------
+    if big_wl and Path(big_wl).exists():
+        add(family="wl_big", kind="wl", wordlist=big_wl, rule=None, budget=600,
+            resumable=True, name="P4: Grosse Wortliste (roh)")
+        if best64:
+            add(family="wl_big", kind="wl", wordlist=big_wl, rule=best64, budget=1800,
+                resumable=True, name="P4: Grosse Wortliste + best64")
+        if onerule:
+            add(family="wl_big", kind="wl", wordlist=big_wl, rule=onerule, budget=3600,
+                resumable=True, name="P4: Grosse Wortliste + grosse Regel")
+
+    # --- Phase 5: gezielte Masken ------------------------------------------
+    add(family="maskfile", maskfile=str(WORK / "masks.hcmask"), budget=3600,
+        resumable=True, name="P5: Gezielte Masken (Struktur)")
+
+    # --- Phase 6: begrenzte Brute-Force ------------------------------------
+    mn, mx = cfg.get("min_len", 6), min(cfg.get("max_len", 12), 8)
+    charset = "?u?l?d" if cfg.get("has_upper") else "?l?d"
+    if cfg.get("has_symbols"):
+        charset += "?s"
+    add(family="increment", charset=charset, mn=mn, mx=mx, budget=99999,
+        resumable=True, name=f"P6: Brute-Force {mn}-{mx} ({charset})")
+
+    return plan
+
+# --------------------------------------------------------------------------
+# hashcat-Ausfuehrung
 # --------------------------------------------------------------------------
 
 def hashcat_base_cmd(cfg, tools):
@@ -408,14 +533,22 @@ def hashcat_base_cmd(cfg, tools):
            "--potfile-path", str(POTFILE), "--status", "--status-timer", "30"]
     if cfg.get("use_optimized", True):
         cmd.append("-O")
-    # Sonderzeichen als Custom-Charset 1 verfuegbar machen.
     syms = cfg.get("symbols", "").strip()
     if syms:
         cmd += ["-1", syms]
     return cmd
 
+def run_cmd(cmd):
+    info("hashcat: " + " ".join(shlex.quote(x) for x in cmd))
+    try:
+        return subprocess.run(cmd, cwd=str(WORK)).returncode
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        err(f"hashcat-Start fehlgeschlagen: {e}")
+        return -1
+
 def is_cracked(tools):
-    """Autoritative Pruefung ueber das Potfile via --show."""
     if not POTFILE.exists() or POTFILE.stat().st_size == 0:
         return None
     try:
@@ -423,202 +556,197 @@ def is_cracked(tools):
             [tools["hashcat"], "-m", HASH_MODE, str(HASH_FILE),
              "--potfile-path", str(POTFILE), "--show"],
             capture_output=True, text=True, timeout=120)
-        line = r.stdout.strip()
+        line = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
         if line and ":" in line:
-            # Format: <hash>:<passwort>  -> alles nach dem ersten ':' des $7z$-Teils
-            # Der Hash selbst enthaelt ':' nicht (er nutzt '$' und '*'), also rsplit reicht.
-            pw = line.split(":", 1)[1] if line.count(":") == 1 else line[line.rfind(":") + 1:]
-            return pw
+            # Der $7z$-Hash enthaelt keine ':' - alles nach dem ersten ':' ist das Passwort.
+            return line.split(":", 1)[1]
     except Exception:
         pass
     return None
 
-def build_attack_plan(cfg, base_file, num_file, mask_file, tools):
-    """Definiert die eskalierende Reihenfolge. Jeder Eintrag ist ein dict."""
-    plan = []
+# ---- Delta-Angriff: persoenliche Woerter / Hybrid ------------------------
 
-    big_wl = cfg.get("big_wordlist", "").strip()
-    if not big_wl:
-        big_wl = find_first([str(Path(d) / "rockyou.txt") for d in COMMON_WORDLIST_DIRS]) or ""
+def run_word_attack(atk, cfg, tools, ledger, budget):
+    """Testet NUR neue Kandidaten dieser Stufe. Gibt True zurueck, wenn gelaufen."""
+    entry = ledger["attacks"].setdefault(atk["key"], {"name": atk["name"], "words": []})
+    processed = set(entry["words"])
+    current = variant_lines(collect_base_words(cfg))
+    new = sorted(current - processed)
+    if not new:
+        return False  # nichts Neues -> keine Wiederholung
 
-    best64 = find_first([str(Path(d) / "best64.rule") for d in COMMON_RULE_DIRS])
-    onerule = find_first(
-        [str(Path(d) / n) for d in COMMON_RULE_DIRS
-         for n in ("OneRuleToRuleThemAll.rule", "dive.rule", "rockyou-30000.rule")])
-    builtin_rule = str(WORK / "builtin.rule")
+    info(f"Neue Kandidaten in dieser Stufe: {len(new)} (bereits geprueft: {len(processed)})")
+    delta = write_lines(WORK / f"delta_{atk['key']}.txt", new)
 
-    # --- Phase 1: Schnelle, gezielte Treffer (Minuten) --------------------
-    plan.append(dict(name="P1: Persoenliche Woerter (roh)", kind="wl",
-                     wordlist=str(base_file), rule=None, budget=120, resumable=False))
-    plan.append(dict(name="P1: Persoenliche Woerter + Basisregeln", kind="wl",
-                     wordlist=str(base_file), rule=builtin_rule, budget=300, resumable=False))
-
-    # --- Phase 2: Persoenliche Woerter mit starken Regeln -----------------
-    if best64:
-        plan.append(dict(name="P2: Persoenlich + best64", kind="wl",
-                         wordlist=str(base_file), rule=best64, budget=300, resumable=False))
-    if onerule:
-        plan.append(dict(name="P2: Persoenlich + grosse Regel", kind="wl",
-                         wordlist=str(base_file), rule=onerule, budget=900, resumable=True))
-
-    # --- Phase 3: Hybrid & Kombinationen ----------------------------------
-    # Wort + Ziffern (Hybrid -a 6) und Ziffern + Wort (-a 7)
-    plan.append(dict(name="P3: Wort + 2-4 Ziffern (Hybrid)", kind="hybrid6",
-                     wordlist=str(base_file), mask="?d?d?d?d", budget=600, resumable=True))
-    plan.append(dict(name="P3: 2-4 Ziffern + Wort (Hybrid)", kind="hybrid7",
-                     wordlist=str(base_file), mask="?d?d?d?d", budget=600, resumable=True))
-    if cfg.get("symbols"):
-        plan.append(dict(name="P3: Wort + Sonderzeichen (Hybrid)", kind="hybrid6",
-                         wordlist=str(base_file), mask="?1", budget=300, resumable=True))
-    # Zwei persoenliche Woerter kombiniert (-a 1)
-    plan.append(dict(name="P3: Wort + Wort (Kombinator)", kind="combi",
-                     left=str(base_file), right=str(base_file), budget=300, resumable=False))
-    # Wort + Datum/Jahr (-a 1)
-    plan.append(dict(name="P3: Wort + Zahl/Jahr (Kombinator)", kind="combi",
-                     left=str(base_file), right=str(num_file), budget=300, resumable=False))
-
-    # --- Phase 4: Grosse Wortliste ----------------------------------------
-    if big_wl and Path(big_wl).exists():
-        plan.append(dict(name="P4: Grosse Wortliste (roh)", kind="wl",
-                         wordlist=big_wl, rule=None, budget=600, resumable=True))
-        if best64:
-            plan.append(dict(name="P4: Grosse Wortliste + best64", kind="wl",
-                             wordlist=big_wl, rule=best64, budget=1800, resumable=True))
-        if onerule:
-            plan.append(dict(name="P4: Grosse Wortliste + grosse Regel", kind="wl",
-                             wordlist=big_wl, rule=onerule, budget=3600, resumable=True))
-
-    # --- Phase 5: Gezielte Masken -----------------------------------------
-    plan.append(dict(name="P5: Gezielte Masken (Struktur)", kind="maskfile",
-                     maskfile=str(mask_file), budget=3600, resumable=True))
-
-    # --- Phase 6: Begrenzte Brute-Force (letzte Instanz) ------------------
-    mn, mx = cfg.get("min_len", 6), min(cfg.get("max_len", 12), 8)
-    charset = "?l?d"
-    if cfg.get("has_upper"):
-        charset = "?u?l?d"
-    if cfg.get("has_symbols"):
-        charset += "?s"
-    plan.append(dict(name=f"P6: Brute-Force {mn}-{mx} ({charset})", kind="increment",
-                     charset=charset, mn=mn, mx=mx, budget=99999, resumable=True))
-
-    return plan
-
-def run_attack(atk, cfg, tools):
-    """Fuehrt einen einzelnen Angriff aus. Gibt hashcat-Returncode zurueck."""
     base = hashcat_base_cmd(cfg, tools)
-    session = "s_" + re.sub(r"[^a-zA-Z0-9]", "_", atk["name"])[:40]
+    cmd = base + ["--runtime", str(budget)]
+    if atk["kind"] == "wl":
+        cmd += ["-a", "0", str(HASH_FILE), str(delta)]
+        if atk.get("rule"):
+            cmd += ["-r", atk["rule"]]
+    elif atk["kind"] == "hybrid6":
+        cmd += ["-a", "6", str(HASH_FILE), str(delta), atk["mask"]]
+    elif atk["kind"] == "hybrid7":
+        cmd += ["-a", "7", str(HASH_FILE), atk["mask"], str(delta)]
+
+    rc = run_cmd(cmd)
+    if rc in (0, 1):  # abgeschlossen (0=geknackt, 1=Keyspace erschoepft)
+        entry["words"] = sorted(processed | set(new))
+        save_ledger(ledger)
+        log_tested(atk["name"], len(new), len(entry["words"]))
+    else:
+        info("Zeitfenster erreicht - diese neuen Woerter werden beim naechsten Lauf fortgesetzt.")
+    return True
+
+# ---- Delta-Angriff: Kombinator (zwei Listen) -----------------------------
+
+def _combo_source(kind, cfg):
+    if kind == "numbers":
+        return combo_lines(collect_numbers(cfg)) | collect_numbers(cfg)
+    return combo_lines(collect_base_words(cfg))
+
+def run_combi_attack(atk, cfg, tools, ledger, budget):
+    """Kombinator L x R, aber nur die NEUEN Paare (Lneu x Ralle) u (Lalt x Rneu)."""
+    entry = ledger["combi"].setdefault(
+        atk["key"], {"name": atk["name"], "left": [], "right": []})
+    Lall = _combo_source(atk["left_kind"], cfg)
+    Rall = _combo_source(atk["right_kind"], cfg)
+    Lproc, Rproc = set(entry["left"]), set(entry["right"])
+    Lnew, Rnew = sorted(Lall - Lproc), sorted(Rall - Rproc)
+
+    runs = []
+    if Lnew:
+        runs.append((Lnew, sorted(Rall)))          # neue linke x alle rechten
+    if Rnew and Lproc:
+        runs.append((sorted(Lproc), Rnew))         # alte linke x neue rechte
+    if not runs:
+        return False  # nichts Neues
+
+    total_new_pairs = len(Lnew) * len(Rall) + len(Lproc) * len(Rnew)
+    info(f"Neue Wort-Paare in dieser Stufe: ~{total_new_pairs}")
+    per = max(30, budget // len(runs))
+    base = hashcat_base_cmd(cfg, tools)
+    completed_all = True
+    for i, (Lf, Rf) in enumerate(runs):
+        lp = write_lines(WORK / f"combi_{atk['key']}_L{i}.txt", Lf)
+        rp = write_lines(WORK / f"combi_{atk['key']}_R{i}.txt", Rf)
+        rc = run_cmd(base + ["--runtime", str(per), "-a", "1",
+                             str(HASH_FILE), str(lp), str(rp)])
+        if rc not in (0, 1):
+            completed_all = False
+            break
+    if completed_all:
+        entry["left"] = sorted(Lall)
+        entry["right"] = sorted(Rall)
+        save_ledger(ledger)
+        log_tested(atk["name"], total_new_pairs, len(Lall) * len(Rall))
+    else:
+        info("Zeitfenster erreicht - restliche neue Paare folgen beim naechsten Lauf.")
+    return True
+
+# ---- Nicht-Delta-Angriff: grosse Wortliste / Masken / Brute-Force --------
+
+def run_fixed_attack(atk, cfg, tools, budget):
+    base = hashcat_base_cmd(cfg, tools)
+    session = "s_" + atk["key"]
     restore_path = WORK / (session + ".restore")
 
-    # Wenn Angriff schon laeuft/lief und resumable -> fortsetzen.
     if atk.get("resumable") and restore_path.exists():
-        cmd = base + ["--session", session, "--restore",
-                      "--runtime", str(atk["budget"])]
+        cmd = base + ["--session", session, "--restore", "--runtime", str(budget)]
     else:
-        cmd = base + ["--session", session, "--runtime", str(atk["budget"])]
-        kind = atk["kind"]
-        if kind == "wl":
+        cmd = base + ["--session", session, "--runtime", str(budget)]
+        fam = atk["family"]
+        if fam == "wl_big":
             cmd += ["-a", "0", str(HASH_FILE), atk["wordlist"]]
             if atk.get("rule"):
                 cmd += ["-r", atk["rule"]]
-        elif kind == "combi":
-            cmd += ["-a", "1", str(HASH_FILE), atk["left"], atk["right"]]
-        elif kind == "hybrid6":
-            cmd += ["-a", "6", str(HASH_FILE), atk["wordlist"], atk["mask"]]
-        elif kind == "hybrid7":
-            cmd += ["-a", "7", str(HASH_FILE), atk["mask"], atk["wordlist"]]
-        elif kind == "maskfile":
+        elif fam == "maskfile":
             cmd += ["-a", "3", str(HASH_FILE), atk["maskfile"]]
-        elif kind == "increment":
+        elif fam == "increment":
             mask = atk["charset"] * atk["mx"]
             cmd += ["-a", "3", "--increment",
                     "--increment-min", str(atk["mn"]),
                     "--increment-max", str(atk["mx"]),
                     str(HASH_FILE), mask]
-        else:
-            warn(f"Unbekannter Angriffstyp: {kind}")
-            return 1
+    return run_cmd(cmd)
 
-    info("hashcat: " + " ".join(cmd))
-    try:
-        # stdout/stderr durchreichen, damit du den Live-Status siehst.
-        proc = subprocess.run(cmd, cwd=str(WORK))
-        return proc.returncode
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        err(f"hashcat-Start fehlgeschlagen: {e}")
-        return -1
+# --------------------------------------------------------------------------
+# Plan ausfuehren
+# --------------------------------------------------------------------------
 
 def run_plan(cfg, tools):
-    plan_meta = build_attack_plan(cfg, WORK / "personal_base.txt",
-                                  WORK / "personal_numbers.txt",
-                                  WORK / "masks.hcmask", tools)
+    plan = build_attack_plan(cfg)
+    ledger = load_ledger()
     state = load_json(STATE_FILE, {"exhausted": []})
     exhausted = set(state.get("exhausted", []))
 
     deadline = time.time() + cfg.get("total_hours", 8) * 3600
     head(f"Angriffsplan startet - Laufzeit-Budget: {cfg.get('total_hours',8)} h")
-    info(f"{len(plan_meta)} Angriffsstufen. Stoppt bei Treffer oder Zeitablauf.")
+    info(f"{len(plan)} Angriffsstufen. Stoppt bei Treffer oder Zeitablauf.")
     info("Abbrechen mit Strg-C ist sicher - Fortschritt wird gespeichert.")
+    info("Bereits geprueftes wird uebersprungen; nur Neues wird getestet.")
 
     lap = 0
     while time.time() < deadline:
         lap += 1
-        made_progress = False
-        for atk in plan_meta:
-            if atk["name"] in exhausted:
-                continue
+        ran_something = False
+        for atk in plan:
             if time.time() >= deadline:
                 break
-
-            # Treffer schon vorhanden?
             pw = is_cracked(tools)
             if pw:
                 return announce_result(pw)
 
-            # Restbudget dieser Runde begrenzen.
             remaining = int(deadline - time.time())
             if remaining <= 5:
                 break
             eff_budget = min(atk["budget"], remaining)
-            atk_run = dict(atk, budget=eff_budget)
+            fam = atk["family"]
 
-            head(f"[Runde {lap}] {atk['name']}  (bis zu {eff_budget}s)")
-            rc = run_attack(atk_run, cfg, tools)
-            made_progress = True
+            if fam in ("wl_personal", "hybrid_personal"):
+                head(f"[Runde {lap}] {atk['name']}")
+                if run_word_attack(atk, cfg, tools, ledger, eff_budget):
+                    ran_something = True
+            elif fam == "combi":
+                head(f"[Runde {lap}] {atk['name']}")
+                if run_combi_attack(atk, cfg, tools, ledger, eff_budget):
+                    ran_something = True
+            else:
+                if atk["name"] in exhausted:
+                    continue
+                head(f"[Runde {lap}] {atk['name']}  (bis zu {eff_budget}s)")
+                rc = run_fixed_attack(atk, cfg, tools, eff_budget)
+                ran_something = True
+                if rc == 1:
+                    ok(f"Stufe erschoepft: {atk['name']}")
+                    exhausted.add(atk["name"])
+                    save_json(STATE_FILE, {"exhausted": sorted(exhausted)})
+                elif rc in (2, 3, 4):
+                    info("Zeitfenster erreicht - Stufe wird spaeter fortgesetzt.")
+                elif rc < 0 or rc == 255:
+                    warn(f"Fehlercode {rc} bei '{atk['name']}' - Stufe wird uebersprungen.")
+                    exhausted.add(atk["name"])
+                    save_json(STATE_FILE, {"exhausted": sorted(exhausted)})
 
             pw = is_cracked(tools)
             if pw:
                 return announce_result(pw)
 
-            if rc == 1:
-                # Exhausted -> Keyspace komplett durch, nie wieder starten.
-                ok(f"Stufe erschoepft: {atk['name']}")
-                exhausted.add(atk["name"])
-                save_json(STATE_FILE, {"exhausted": sorted(exhausted)})
-            elif rc in (2, 3, 4):
-                info("Zeitfenster erreicht - Stufe wird spaeter fortgesetzt.")
-            elif rc < 0 or rc == 255:
-                warn(f"Fehlercode {rc} bei '{atk['name']}' - Stufe wird uebersprungen.")
-                exhausted.add(atk["name"])
-                save_json(STATE_FILE, {"exhausted": sorted(exhausted)})
-
-        if not made_progress:
-            warn("Alle Stufen erschoepft oder uebersprungen. Nichts mehr zu tun.")
+        if not ran_something:
+            warn("Nichts Neues zu testen (alle Stufen erschoepft / keine neuen Woerter).")
+            print("  Ergaenze Woerter mit:  python3 recover.py add <wort> ...")
+            print("  oder erhoehe die Laufzeit / gib eine groessere Wortliste an.")
             break
 
-    # Zeit abgelaufen ohne Treffer.
     pw = is_cracked(tools)
     if pw:
         return announce_result(pw)
-
     head("Zeitbudget aufgebraucht - noch kein Treffer")
     print("""  Naechste sinnvolle Schritte:
-    * Mehr/bessere persoenliche Woerter ergaenzen:   python3 recover.py intake
-    * Groessere Wortliste angeben (rockyou, SecLists) und erneut 'run'
-    * Laufzeit erhoehen (Frage 'Gesamtlaufzeit') und erneut 'run'
-    * Bereits gelaufene Stufen werden dank Session/Potfile fortgesetzt.
+    * Woerter ergaenzen (nur diese werden getestet):  python3 recover.py add <wort> ...
+    * Fortschritt ansehen:                            python3 recover.py words
+    * Groessere Wortliste angeben und erneut 'run'
+    * Laufzeit erhoehen und erneut 'run' (setzt automatisch fort)
 """)
     return False
 
@@ -632,7 +760,86 @@ def announce_result(pw):
     return True
 
 # --------------------------------------------------------------------------
-# Selbsttest: erzeugt ein Mini-7z mit bekanntem Passwort und knackt es.
+# Woerter-Verwaltung & Fortschrittsanzeige
+# --------------------------------------------------------------------------
+
+def cmd_add(new_words):
+    WORDS_DIR.mkdir(parents=True, exist_ok=True)
+    existing = set()
+    if DICT_FILE.exists():
+        for line in DICT_FILE.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                existing.add(s)
+    else:
+        DICT_FILE.write_text("# Dein Woerterbuch - ein Wort pro Zeile.\n", encoding="utf-8")
+
+    added = [w.strip() for w in new_words if w.strip() and w.strip() not in existing]
+    if not added:
+        warn("Keine neuen Woerter (alle schon vorhanden).")
+        return
+    with open(DICT_FILE, "a", encoding="utf-8") as fh:
+        for w in added:
+            fh.write(w + "\n")
+    ok(f"{len(added)} Wort(e) ergaenzt in {DICT_FILE}:")
+    for w in added:
+        print("     + " + w)
+    info("Beim naechsten 'run' werden NUR diese neuen Woerter/Kombinationen getestet.")
+
+def cmd_words(cfg, tools):
+    head("Woerterbuch & Pruef-Fortschritt")
+    base = collect_base_words(cfg)
+    variants = variant_lines(base)
+    numbers = collect_numbers(cfg)
+
+    print(f"  Woerterbuch-Dateien in {WORDS_DIR}/:")
+    if WORDS_DIR.exists():
+        for f in sorted(WORDS_DIR.glob("*.txt")):
+            n = sum(1 for l in f.read_text(encoding='utf-8', errors='ignore').splitlines()
+                    if l.strip() and not l.strip().startswith("#"))
+            print(f"    - {f.name:20} {n} Eintraege")
+    print(f"  Basiswoerter gesamt : {len(base)}")
+    print(f"  Kandidaten (Varianten): {len(variants)}")
+    print(f"  Zahlen/Jahre        : {len(numbers)}")
+
+    ledger = load_ledger()
+    print()
+    print(c("  Fortschritt je Stufe (verarbeitet / aktuell / NEU offen):", "bold"))
+    for atk in build_attack_plan(cfg):
+        fam = atk["family"]
+        if fam in ("wl_personal", "hybrid_personal"):
+            proc = set(ledger["attacks"].get(atk["key"], {}).get("words", []))
+            total = len(variants)
+            new = len(set(variants) - proc)
+            flag = c("neu!", "y") if new else c("fertig", "g")
+            print(f"    [{flag}] {atk['name']:42} {len(proc):5} / {total:5} / {new}")
+        elif fam == "combi":
+            e = ledger["combi"].get(atk["key"], {})
+            Lall = _combo_source(atk["left_kind"], cfg)
+            Rall = _combo_source(atk["right_kind"], cfg)
+            Lp, Rp = len(e.get("left", [])), len(e.get("right", []))
+            done = (Lp >= len(Lall) and Rp >= len(Rall))
+            flag = c("fertig", "g") if done else c("neu!", "y")
+            print(f"    [{flag}] {atk['name']:42} L {Lp}/{len(Lall)}  R {Rp}/{len(Rall)}")
+
+    state = load_json(STATE_FILE, {"exhausted": []})
+    exhausted = set(state.get("exhausted", []))
+    print()
+    print(c("  Feste Stufen (grosse Wortliste / Masken / Brute-Force):", "bold"))
+    for atk in build_attack_plan(cfg):
+        if atk["family"] in ("wl_big", "maskfile", "increment"):
+            status = c("erschoepft", "g") if atk["name"] in exhausted else c("offen/laeuft", "y")
+            print(f"    [{status}] {atk['name']}")
+
+    if TESTED_LOG.exists():
+        print()
+        info(f"Chronologisches Protokoll: {TESTED_LOG}")
+        tail = TESTED_LOG.read_text(encoding="utf-8").splitlines()[-8:]
+        for line in tail:
+            print("    " + line)
+
+# --------------------------------------------------------------------------
+# Selbsttest
 # --------------------------------------------------------------------------
 
 def run_selftest(cfg, tools):
@@ -655,7 +862,6 @@ def run_selftest(cfg, tools):
         return False
     ok(f"Test-Archiv erstellt (Passwort: {test_pw})")
 
-    # Hash extrahieren in separate Datei.
     tool = tools.get("7z2hashcat") or tools.get("7z2john")
     if not tool:
         err("Kein 7z2hashcat/7z2john gefunden.")
@@ -673,11 +879,8 @@ def run_selftest(cfg, tools):
     th = testdir / "hash.txt"
     th.write_text(h + "\n", encoding="utf-8")
     tp = testdir / "pot"
-
-    # Kleine Maske, die Test123! trifft.
     cmd = [tools["hashcat"], "-m", HASH_MODE, "-a", "3", "-w", "3",
-           "--potfile-path", str(tp), "-1", "!?.@", str(th),
-           "Test?d?d?d?1"]
+           "--potfile-path", str(tp), "-1", "!?.@", str(th), "Test?d?d?d?1"]
     info("hashcat Selbsttest laeuft ...")
     subprocess.run(cmd, cwd=str(testdir))
     r2 = subprocess.run([tools["hashcat"], "-m", HASH_MODE, str(th),
@@ -708,50 +911,65 @@ def main():
     p = argparse.ArgumentParser(
         description="Interaktiver 7-Zip Passwort-Recovery-Orchestrator (eigene Dateien).")
     p.add_argument("command", nargs="?", default="run",
-                   choices=["run", "intake", "extract", "selftest", "status", "reset"],
-                   help="run=alles; intake=nur Fragen; extract=nur Hash; "
-                        "selftest=Toolchain testen; status=Stand; reset=zuruecksetzen")
+                   choices=["run", "intake", "extract", "selftest",
+                            "status", "words", "add", "reset"],
+                   help="run=alles; intake=Fragen; extract=nur Hash; selftest=Toolchain testen; "
+                        "status=Stand; words=Fortschritt/Woerterbuch; add=Woerter ergaenzen; "
+                        "reset=zuruecksetzen")
+    p.add_argument("rest", nargs="*", help="fuer 'add': die neuen Woerter")
     p.add_argument("--archive", "-f", help="Pfad zur .7z-Datei")
     args = p.parse_args()
 
-    head("7-Zip Passwort-Recovery  (nur fuer EIGENE Dateien)")
     tools = detect_tools()
+
+    # Befehle ohne Tool-/Header-Rauschen:
+    if args.command == "add":
+        cmd_add(args.rest)
+        return
+
+    head("7-Zip Passwort-Recovery  (nur fuer EIGENE Dateien)")
     for name in ("hashcat", "perl"):
         print(f"  {name:12}: {tools.get(name) or c('FEHLT', 'r')}")
     print(f"  {'7z2hashcat':12}: {tools.get('7z2hashcat') or c('fehlt (7z2john als Fallback)','y')}")
     print(f"  {'7z2john':12}: {tools.get('7z2john') or c('fehlt','y')}")
 
+    cfg = load_json(CONFIG_FILE, {})
+
     if args.command == "reset":
-        for f in (CONFIG_FILE, STATE_FILE, HASH_FILE, RESULT_FILE):
+        for f in (CONFIG_FILE, STATE_FILE, HASH_FILE, RESULT_FILE, LEDGER_FILE, TESTED_LOG):
             if f.exists():
                 f.unlink()
         for f in WORK.glob("s_*"):
             f.unlink()
-        ok("Zuruckgesetzt (Potfile bleibt erhalten). Config/State/Hash geloescht.")
+        for f in WORK.glob("delta_*"):
+            f.unlink()
+        for f in WORK.glob("combi_*"):
+            f.unlink()
+        ok("Zuruckgesetzt (Potfile & words/ bleiben erhalten).")
         return
 
-    if not tools.get("hashcat") or not tools.get("perl"):
-        print_install_hint()
-        if args.command not in ("intake",):
-            return
+    if args.command == "words":
+        cmd_words(cfg, tools)
+        return
 
     if args.command == "status":
         cmd_status(tools)
         return
 
     if args.command == "intake":
-        run_intake()
-        cfg = load_json(CONFIG_FILE, {})
-        generate_wordlists(cfg)
+        cfg = run_intake()
+        prepare_inputs(cfg)
+        return
+
+    if not tools.get("hashcat") or not tools.get("perl"):
+        print_install_hint()
         return
 
     if args.command == "selftest":
-        cfg = load_json(CONFIG_FILE, {})
         run_selftest(cfg, tools)
         return
 
-    # command == extract oder run: Archiv wird gebraucht.
-    cfg = load_json(CONFIG_FILE, {})
+    # extract / run brauchen das Archiv.
     archive = args.archive or cfg.get("archive")
     if not archive:
         archive = ask("Pfad zu deiner .7z-Datei")
@@ -766,22 +984,21 @@ def main():
         ok("Hash-Extraktion abgeschlossen.")
         return
 
-    # command == run: ggf. Intake nachholen.
-    if not CONFIG_FILE.exists() or "words" not in cfg:
-        run_intake()
-        cfg = load_json(CONFIG_FILE, {})
+    # run: ggf. Intake nachholen.
+    if "words" not in cfg:
+        cfg = run_intake()
         cfg["archive"] = archive
         save_json(CONFIG_FILE, cfg)
     else:
-        info("Vorhandene Konfiguration wird genutzt (aendern mit: python3 recover.py intake).")
+        info("Vorhandene Konfiguration wird genutzt (aendern: python3 recover.py intake).")
 
-    generate_wordlists(cfg)
+    prepare_inputs(cfg)
 
     try:
         run_plan(cfg, tools)
     except KeyboardInterrupt:
         print()
-        warn("Abgebrochen. Fortschritt gespeichert - einfach spaeter 'python3 recover.py run'.")
+        warn("Abgebrochen. Fortschritt gespeichert - spaeter einfach 'python3 recover.py run'.")
 
 if __name__ == "__main__":
     main()
