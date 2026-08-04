@@ -100,6 +100,7 @@ verwertbaren Bezug zum Fehlerbild.
 hf_presse/
   simulate.py       Simulator (nur Standardbibliothek)
   baseline.py       Referenz-Baseline (nur Standardbibliothek)
+  run_tabfm.py      Runner für Googles TabFM (braucht tabfm + torch)
   README.md         dieses Dokument
 data/
   cycles.csv        1165 Zeilen — eine je Presszyklus  ◀ Haupttabelle
@@ -224,6 +225,28 @@ Baseline reproduzieren:
 python3 baseline.py --data ../data/cycles.csv
 python3 baseline.py --data ../data/cycles.csv --hard
 ```
+
+### TabFM dagegen laufen lassen
+
+```bash
+pip install "tabfm[pytorch]"
+python3 run_tabfm.py            # Standardmodus
+python3 run_tabfm.py --hard     # ohne Zählerstände
+```
+
+`run_tabfm.py` gibt die TabFM-Ergebnisse direkt neben den Referenzwerten aus und
+benutzt für AUC und MAE denselben Code wie `baseline.py`, damit die Zahlen
+vergleichbar sind. Die Gewichte (`google/tabfm-1.0.0-pytorch`) lädt TabFM beim
+ersten Lauf von Hugging Face. Ist Hugging Face gesperrt, die Gewichte einmal
+anderswo holen und den Ordner übergeben:
+
+```bash
+huggingface-cli download google/tabfm-1.0.0-pytorch --local-dir tabfm-w
+python3 run_tabfm.py --checkpoint tabfm-w
+```
+
+Auf CPU ist die Vorgabe-Ensemblegröße von 32 langsam; `run_tabfm.py` nutzt
+deshalb 8 und lässt sich mit `--n-estimators 32 --device cuda` hochdrehen.
 
 ### Der `--hard`-Modus
 
